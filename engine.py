@@ -1,47 +1,72 @@
 import random
-import math
+import numpy as np
+
+
+def unbroadcast(grad, shape):
+    if isinstance(grad, (int, float)):
+        return grad
+    while grad.ndim > len(shape):
+        grad = grad.sum(axis=0)
+    for i, (grad_dim, shape_dim) in enumerate(zip(grad.shape, shape)):
+        if shape_dim == 1 and not grad_dim == 1:
+            grad = grad.sum(axis=i, keepdims=True)
+    return grad
+
+def stack(x:list):
+    data = [value.data for value in x]
+    data = np.array(data)
+    out = Value(data, x, "stack")
+    def backward():
+        for i,value in enumerate(x):
+            value.grad += out.grad[i]
+    out._backward = backward
+    return out
 
 class Value:
     def __init__(self, data, _children=(), _op=''):
         self.data = data
         self._children = set(_children)
         self._op = _op
-        self.backward = lambda: None
-        self.grad = 0.0
+        self._backward = lambda: None
+
+        if isinstance(self.data,np.ndarray):
+            self.grad = np.zeros_like(data, dtype=float)
+        else:
+            self.grad = 0.0
 
     def __add__(self, other):
-        other = Value(other) if isinstance(other, (int, float)) else other
+        other = Value(other) if isinstance(other, (int, float,np.ndarray,np.number)) else other
         x = Value(self.data + other.data, (self, other), '+')
         def backward():
-            self.grad += x.grad
-            other.grad += x.grad
-        x.backward = backward
+            self.grad += unbroadcast(x.grad, np.shape(self.data))
+            other.grad += unbroadcast(x.grad, np.shape(other.data))
+        x._backward = backward
         return x
 
     def __mul__(self, other):
-        other =  Value(other) if isinstance(other,(int,float)) else other
+        other =  Value(other) if isinstance(other,(int,float,np.ndarray,np.number)) else other
         x = Value(self.data * other.data, (self, other), '*')
         def backward():
-            self.grad += other.data*x.grad
-            other.grad += self.data*x.grad
-        x.backward = backward
+            self.grad += unbroadcast(other.data*x.grad, np.shape(self.data))
+            other.grad += unbroadcast(self.data*x.grad, np.shape(other.data))
+        x._backward = backward
         return x
 
     def __pow__(self, power):
-        assert isinstance(power, int)
-        x = Value(pow(self.data, power), (self,), '**')
+        assert isinstance(power, (int, float))
+        x = Value(self.data ** power, (self,), '**')
         def backward():
-            self.grad += power*(self.data**(power - 1))*x.grad
-        x.backward = backward
+            self.grad += unbroadcast(power*(self.data**(power - 1))*x.grad, np.shape(self.data))
+        x._backward = backward
         return x
 
     def tanh(self):
-        e2x = math.exp(2*self.data)
+        e2x = np.exp(2*self.data)
         x = 1 - 2/(e2x+1)
         x = Value(x, (self,), 'tanh')
         def backward():
-            self.grad += (1 - x.data**2)*x.grad
-        x.backward = backward
+            self.grad += unbroadcast((1 - x.data**2)*x.grad, np.shape(self.data))
+        x._backward = backward
         return x
 
     def __rtruediv__(self, other):
@@ -74,25 +99,32 @@ class Value:
         topo(self)
         self.grad = 1.0
         for v in reversed(node):
-            v.backward()
+            v._backward()
+
+    def sum(self):
+        x = Value(self.data.sum(),(self,),"sum")
+        def backward():
+            self.grad +=  np.ones_like(self.data, dtype=float) * x.grad
+        x._backward = backward
+        return x
 
     def __repr__(self):
         return f"Data:{self.data}"
 
 class Neuron:
     def __init__(self, input_num):
-        self.ws = [Value(random.uniform(-1.0,1.0)) for x in range(input_num)]
+        self.ws = Value(np.random.randn(input_num))
         self.bias = Value(random.uniform(-1.0,1.0))
 
     def forward(self, input_x):
-        result = sum((x * y for x, y in zip(self.ws, input_x)),self.bias)
-        return result
+        result = (input_x * self.ws).sum() + self.bias
+        return result.tanh()
 
     def __call__(self, input_x):
         return self.forward(input_x)
 
     def parameters(self):
-        return self.ws + [self.bias]
+        return [self.ws, self.bias]
 
 class Layer:
     def __init__(self, input_num, output_num):
@@ -100,7 +132,8 @@ class Layer:
 
     def forward(self, input_x):
         result = [neuron(input_x) for neuron in self.neurons]
-        return result[0] if len(result)==1 else result
+        result = stack(result)
+        return result
 
     def __call__(self, input_x):
         return self.forward(input_x)
@@ -132,7 +165,10 @@ class Optimizer:
 
     def zero_grad(self):
         for parameter in self.parameters:
-            parameter.grad = 0.0
+            if isinstance(parameter.data,np.ndarray):
+                parameter.grad = np.zeros_like(parameter.grad)
+            else:
+                parameter.grad  = 0.0
 
     def update(self, lr):
         for parameter in self.parameters:
