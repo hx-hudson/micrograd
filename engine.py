@@ -3,7 +3,7 @@ import numpy as np
 
 
 def unbroadcast(grad, shape):
-    if isinstance(grad, (int, float)):
+    if not isinstance(grad, np.ndarray):
         return grad
     while grad.ndim > len(shape):
         grad = grad.sum(axis=0)
@@ -69,6 +69,41 @@ class Value:
         x._backward = backward
         return x
 
+    def __matmul__(self, other):
+        other = Value(other) if isinstance(other, (int, float, np.ndarray, np.number)) else other
+        x = Value(self.data @ other.data, (self, other), "@")
+        def backward():
+            self_dim = np.ndim(self.data)
+            other_dim = np.ndim(other.data)
+            if self_dim == 1 and other_dim ==1:
+                self.grad += x.grad * other.data
+                other.grad += x.grad * self.data
+                return
+
+            self_matrix, other_matrix, x_matrix = self.data, other.data, x.grad
+            if self_dim == 1:
+                self_matrix = self.data[..., None, :]
+                x_matrix = x.grad[..., None, :]
+            if other_dim == 1:
+                other_matrix = other.data[..., :, None]
+                x_matrix = x.grad[..., :, None]
+
+            d_self = np.matmul(x_matrix, np.swapaxes(other_matrix, -1, -2))
+            d_other = np.matmul(np.swapaxes(self_matrix, -1, -2), x_matrix)
+
+            if self_dim == 1:
+                d_self = np.squeeze(d_self, axis=-2)
+            if other_dim == 1:
+                d_other = np.squeeze(d_other, axis=-1)
+
+            self.grad += unbroadcast(d_self, np.shape(self.data))
+            other.grad += unbroadcast(d_other, np.shape(other.data))
+        x._backward = backward
+        return x
+
+    def __rmatmul__(self, other):
+        return Value(other) @ self
+
     def __rtruediv__(self, other):
         return Value(other)*self**-1
 
@@ -97,7 +132,10 @@ class Value:
                     topo(n)
                 node.append(x)
         topo(self)
-        self.grad = 1.0
+        if isinstance(self.data, np.ndarray):
+            self.grad = np.ones_like(self.data, dtype=float)
+        else:
+            self.grad = 1.0
         for v in reversed(node):
             v._backward()
 
@@ -105,6 +143,13 @@ class Value:
         x = Value(self.data.sum(),(self,),"sum")
         def backward():
             self.grad +=  np.ones_like(self.data, dtype=float) * x.grad
+        x._backward = backward
+        return x
+
+    def reshape(self, *shape):
+        x = Value(self.data.reshape(*shape), (self,), 'reshape')
+        def backward():
+            self.grad += x.grad.reshape(self.data.shape)
         x._backward = backward
         return x
 
@@ -117,7 +162,7 @@ class Neuron:
         self.bias = Value(random.uniform(-1.0,1.0))
 
     def forward(self, input_x):
-        result = (input_x * self.ws).sum() + self.bias
+        result = input_x @ self.ws + self.bias
         return result.tanh()
 
     def __call__(self, input_x):
@@ -126,32 +171,34 @@ class Neuron:
     def parameters(self):
         return [self.ws, self.bias]
 
-class Layer:
+class LinearLayer:
     def __init__(self, input_num, output_num):
-        self.neurons = [Neuron(input_num) for i in range(output_num)]
+        self.weights = Value(np.random.randn(input_num, output_num))
+        self.bias = Value(np.random.randn(output_num))
 
     def forward(self, input_x):
-        result = [neuron(input_x) for neuron in self.neurons]
-        result = stack(result)
-        return result
+        y = input_x @ self.weights + self.bias
+        return y
 
     def __call__(self, input_x):
         return self.forward(input_x)
 
     def parameters(self):
-        return [ws for neuron in self.neurons for ws in neuron.parameters()]
+        return [self.weights, self.bias]
 
 class MLP:
     def __init__(self, input_num, layer_num:list):
         length = len(layer_num)
         sizes = [input_num] + list(layer_num)
-        self.layers = [Layer(sizes[i],sizes[i+1]) for i in range(length)]
+        self.layers = [LinearLayer(sizes[i],sizes[i+1]) for i in range(length)]
 
     def forward(self, input_x):
-        result = input_x
-        for layer in self.layers:
-            result = layer(result)
-        return result
+        y = input_x
+        for i, layer in enumerate(self.layers):
+            y = layer(y)
+            if i<len(self.layers)-1:
+                y = y.tanh()
+        return y.reshape(-1, 1)
 
     def __call__(self, input_x):
         return self.forward(input_x)
