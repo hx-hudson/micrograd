@@ -22,6 +22,76 @@ def stack(x:list):
     out._backward = backward
     return out
 
+def conv2d(x, w, b=None, stride=1, padding=0):
+    p = padding
+    if b is not None:
+        bias = Value(b) if not isinstance(b, Value) else b
+        assert bias.data.ndim == 1
+    x = Value(x) if not isinstance(x, Value) else x
+    weight = Value(w) if not isinstance(w, Value) else w
+    assert x.data.ndim == 4 and weight.data.ndim == 4
+    assert weight.data.shape[1] == x.data.shape[1]
+
+    x_padding = np.pad(x.data, ((0,0),(0,0),(p,p),(p,p))) if p!=0 else x.data
+    x_padding_shape = np.shape(x_padding)
+    w_shape = np.shape(weight.data)
+
+    first_dim_length = int((x_padding_shape[-2] - w_shape[-2])//stride) + 1
+    second_dim_length = int((x_padding_shape[-1] - w_shape[-1])//stride) + 1
+    w_out_channel = w_shape[0]
+    y_data = np.zeros((x_padding_shape[0],w_out_channel,first_dim_length,second_dim_length))
+    for c in range(w_out_channel):
+        sub_weight = weight.data[c,...]
+        for i in range(first_dim_length):
+            for j in range(second_dim_length):
+                sub_x = x_padding[..., i*stride : i*stride + w_shape[-2], j*stride : j*stride + w_shape[-1]]
+                sub_sum = (sub_x * sub_weight).sum(axis=(1, 2, 3))
+                y_data[:, c, i, j] = sub_sum
+    if b is not None:
+        y = Value(y_data+bias.data[None, :, None, None], (weight, x, bias), "conv2d")
+    else:
+        y = Value(y_data, (weight, x), "conv2d")
+
+
+    def backward():
+        padding_grad = np.zeros_like(x_padding)
+        for c2 in range(w_out_channel):
+            sub_w_data = weight.data[c2, ...]
+            for i2 in range(first_dim_length):
+                for j2 in range(second_dim_length):
+                    grad = y.grad[:, c2, i2, j2]
+                    sub_x2 = x_padding[:, :, i2*stride : i2*stride + w_shape[-2], j2*stride : j2*stride + w_shape[-1]]
+                    weight.grad[c2, ...] += (sub_x2* grad[:, None, None, None]).sum(axis=0)
+                    padding_grad[:, :, i2*stride : i2*stride + w_shape[-2], j2*stride : j2*stride + w_shape[-1]] += sub_w_data[None, ...] * grad[:, None, None, None]
+        if b is not None:
+            bias.grad += y.grad.sum(axis=(0,2,3))
+        x.grad += padding_grad[:, :, p:-p, p:-p] if p!=0 else padding_grad
+
+    y._backward = backward
+    return y
+
+class Conv2dLayer:
+    def __init__(self, in_channel, out_channel, kernel_size, bias=True, stride=1, padding=0):
+        self.weight = Value(np.random.randn(out_channel,in_channel,kernel_size,kernel_size))
+        if bias:
+            self.bias = Value(np.random.randn(out_channel))
+        else:
+            self.bias = None
+        self.stride = stride
+        self.padding = padding
+
+    def forward(self, x):
+        y = conv2d(x, self.weight, self.bias, self.stride, self.padding)
+        return y
+
+    def parameters(self):
+        if self.bias is not None:
+            return [self.weight, self.bias]
+        return [self.weight]
+
+    def __call__(self, x):
+        return self.forward(x)
+
 class Value:
     def __init__(self, data, _children=(), _op=''):
         self.data = data
@@ -161,12 +231,12 @@ class Neuron:
         self.ws = Value(np.random.randn(input_num))
         self.bias = Value(random.uniform(-1.0,1.0))
 
-    def forward(self, input_x):
-        result = input_x @ self.ws + self.bias
+    def forward(self, x):
+        result = x @ self.ws + self.bias
         return result.tanh()
 
-    def __call__(self, input_x):
-        return self.forward(input_x)
+    def __call__(self, x):
+        return self.forward(x)
 
     def parameters(self):
         return [self.ws, self.bias]
@@ -176,12 +246,12 @@ class LinearLayer:
         self.weights = Value(np.random.randn(input_num, output_num))
         self.bias = Value(np.random.randn(output_num))
 
-    def forward(self, input_x):
-        y = input_x @ self.weights + self.bias
+    def forward(self, x):
+        y = x @ self.weights + self.bias
         return y
 
-    def __call__(self, input_x):
-        return self.forward(input_x)
+    def __call__(self, x):
+        return self.forward(x)
 
     def parameters(self):
         return [self.weights, self.bias]
@@ -192,16 +262,16 @@ class MLP:
         sizes = [input_num] + list(layer_num)
         self.layers = [LinearLayer(sizes[i],sizes[i+1]) for i in range(length)]
 
-    def forward(self, input_x):
-        y = input_x
+    def forward(self, x):
+        y = x
         for i, layer in enumerate(self.layers):
             y = layer(y)
             if i<len(self.layers)-1:
                 y = y.tanh()
         return y.reshape(-1, 1)
 
-    def __call__(self, input_x):
-        return self.forward(input_x)
+    def __call__(self, x):
+        return self.forward(x)
 
     def parameters(self):
         return [ws for layer in self.layers for ws in layer.parameters()]
