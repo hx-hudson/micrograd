@@ -61,7 +61,7 @@ def conv2d(x, w, b=None, stride=1, padding=0):
                 for j2 in range(second_dim_length):
                     grad = y.grad[:, c2, i2, j2]
                     sub_x2 = x_padding[:, :, i2*stride : i2*stride + w_shape[-2], j2*stride : j2*stride + w_shape[-1]]
-                    weight.grad[c2, ...] += (sub_x2* grad[:, None, None, None]).sum(axis=0)
+                    weight.grad[c2, ...] += (sub_x2 * grad[:, None, None, None]).sum(axis=0)
                     padding_grad[:, :, i2*stride : i2*stride + w_shape[-2], j2*stride : j2*stride + w_shape[-1]] += sub_w_data[None, ...] * grad[:, None, None, None]
         if b is not None:
             bias.grad += y.grad.sum(axis=(0,2,3))
@@ -70,11 +70,57 @@ def conv2d(x, w, b=None, stride=1, padding=0):
     y._backward = backward
     return y
 
+def max_pooling(x, stride):
+    # If multiple elements share the maximum value,
+    # the full upstream gradient is propagated to each of them.
+    x = Value(x) if not isinstance(x, Value) else x
+    batch, channel, x_length, x_width = np.shape(x.data)
+    y_length, y_width = (x_length//stride, x_width//stride)
+    y_data = np.zeros((batch, channel, y_length, y_width))
+    mask = np.zeros_like(x.data, dtype=bool) # use bool to save memory
+
+    for i in range(y_length):
+        for j in range(y_width):
+            sub_data = x.data[:, :, i*stride:i*stride+stride, j*stride:j*stride+stride]
+            y_data[:, :, i, j] = np.max(sub_data,axis=(2,3))
+            sub_y_data = y_data[:, :, i, j]
+            y_data_expanded = sub_y_data[:,:,None,None].repeat(stride, axis=2).repeat(stride, axis=3)
+            mask[:, :, i*stride:i*stride+stride, j*stride:j*stride+stride] = (y_data_expanded == sub_data)
+    y = Value(y_data, (x,), "max_pool")
+    def backward():
+        y_grad_expanded = y.grad.repeat(stride, axis=2).repeat(stride,axis=3)
+        x.grad += mask * y_grad_expanded
+    y._backward = backward
+    return y
+
+def cross_entropy(x, y):
+    x = Value(x) if not isinstance(x, Value) else x
+    batch, class_num = np.shape(x.data)
+    y = np.asarray(y, dtype=int)
+
+    # prevent overflow
+    x_data = x.data
+    data_shifted = x_data - np.max(x_data, axis=1, keepdims=True)
+    # softmax
+    data_exp = np.exp(data_shifted)
+    data_softmax = data_exp / np.sum(data_exp, axis=1, keepdims=True)
+
+    y_prob = data_softmax[np.arange(batch), y]
+    loss_data = -np.mean(np.log(y_prob+1e-12))
+    loss = Value(loss_data, (x,), "cross_entropy")
+    def backward():
+        p = data_softmax.copy()
+        p[np.arange(batch), y] -= 1.0
+        x.grad += p / batch * loss.grad
+
+    loss._backward = backward
+    return loss
+
 class Conv2dLayer:
     def __init__(self, in_channel, out_channel, kernel_size, bias=True, stride=1, padding=0):
-        self.weight = Value(np.random.randn(out_channel,in_channel,kernel_size,kernel_size))
+        self.weight = Value(0.01 * np.random.randn(out_channel,in_channel,kernel_size,kernel_size))
         if bias:
-            self.bias = Value(np.random.randn(out_channel))
+            self.bias = Value(np.zeros(out_channel))
         else:
             self.bias = None
         self.stride = stride
@@ -138,6 +184,30 @@ class Value:
             self.grad += unbroadcast((1 - x.data**2)*x.grad, np.shape(self.data))
         x._backward = backward
         return x
+
+    def relu(self):
+        y_data = np.maximum(0, self.data)
+        y = Value(y_data, (self,), "relu")
+        def backward():
+            self.grad += (self.data > 0) * y.grad
+        y._backward = backward
+        return y
+
+    def exp(self):
+        y_data = np.exp(self.data)
+        y = Value(y_data, (self,), "exp")
+        def backward():
+            self.grad += y_data * y.grad
+        y._backward = backward
+        return y
+
+    def log(self, eps = 1e-12):
+        y_data = np.log(self.data)
+        y = Value(y_data, (self,), "log")
+        def backward():
+            self.grad += y.grad / (self.data + eps)
+        y._backward = backward
+        return y
 
     def __matmul__(self, other):
         other = Value(other) if isinstance(other, (int, float, np.ndarray, np.number)) else other
@@ -243,8 +313,8 @@ class Neuron:
 
 class LinearLayer:
     def __init__(self, input_num, output_num):
-        self.weights = Value(np.random.randn(input_num, output_num))
-        self.bias = Value(np.random.randn(output_num))
+        self.weights = Value(0.01 * np.random.randn(input_num, output_num))
+        self.bias = Value(np.zeros(output_num))
 
     def forward(self, x):
         y = x @ self.weights + self.bias
